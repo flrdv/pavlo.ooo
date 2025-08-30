@@ -1,126 +1,97 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
-	"fmt"
-	"github.com/indigo-web/indigo"
-	"github.com/indigo-web/indigo/http"
-	"github.com/indigo-web/indigo/router/inbuilt"
-	"github.com/indigo-web/indigo/router/inbuilt/middleware"
 	"html/template"
 	"log"
+	"net/url"
+	"path"
 	"strings"
-	"sync"
+
+	"github.com/indigo-web/indigo"
+	"github.com/indigo-web/indigo/http"
+	"github.com/indigo-web/indigo/http/codec"
+	"github.com/indigo-web/indigo/http/mime"
+	"github.com/indigo-web/indigo/router/inbuilt"
+	"github.com/indigo-web/indigo/router/inbuilt/middleware"
 )
 
 const (
-	defaultAddr     = ":80"
-	homeTmplPath    = "templates/index.html"
+	homeTemplate    = "templates/index.html"
 	homeDefaultName = "Паша"
 )
 
 var (
-	addr = flag.String(
-		"http", defaultAddr, "specify the server address",
-	)
-	https = flag.String(
-		"https", "",
-		"specify the https server address. Leave empty to not use HTTPS at all",
-	)
-	cert = flag.String(
-		"cert", "",
-		"specify custom server certificate instead of autocert",
-	)
+	httpAddr  = flag.String("http", ":8080", "plain HTTP listen address")
+	httpsAddr = flag.String("https", ":8443", "secure HTTP listen address")
+	certdir   = flag.String("certdir", "", "TLS certificate directory")
 )
-
-type Index struct {
-	mu   *sync.RWMutex
-	tmpl *template.Template
-	path string
-}
-
-func NewIndex(tmplPath string) (*Index, error) {
-	tmpl, err := template.ParseFiles(homeTmplPath)
-	if err != nil {
-		return nil, fmt.Errorf("cannot load home template: %s", err)
-	}
-
-	return &Index{
-		mu:   new(sync.RWMutex),
-		tmpl: tmpl,
-		path: tmplPath,
-	}, nil
-}
-
-func (i *Index) Render(request *http.Request) *http.Response {
-	name, _ := request.Query.Get("name")
-	if len(name) == 0 {
-		name = homeDefaultName
-	}
-
-	resp := request.Respond()
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	if err := i.tmpl.Execute(resp, name); err != nil {
-		return http.Error(request, err)
-	}
-
-	return resp
-}
-
-func (i *Index) ReloadTemplate(request *http.Request) *http.Response {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-
-	tmpl, err := template.ParseFiles(homeTmplPath)
-	if err != nil {
-		return http.Error(request, err)
-	}
-
-	i.tmpl = tmpl
-
-	return http.String(request, "reloaded the template successfully")
-}
 
 func main() {
 	flag.Parse()
 
-	index, err := NewIndex(homeTmplPath)
+	tmpl, err := template.ParseFiles(homeTemplate)
 	if err != nil {
-		log.Fatalf("parse index template: %s", err)
+		log.Fatalf("cannot load home template: %s", err)
 		return
 	}
 
 	r := inbuilt.New().
 		Use(middleware.Recover).
 		Use(middleware.LogRequests()).
-		Get("/", index.Render).
-		Get("/reload-template", index.ReloadTemplate).
-		Static("/static", "static").
+		Get("/", func(request *http.Request) *http.Response {
+			name := request.Params.ValueOr("n", homeDefaultName)
+			resp := request.Respond()
+
+			if err = tmpl.Execute(resp, name); err != nil {
+				return http.Error(request, err)
+			}
+
+			return resp
+		}).
+		Get("/n/:name", func(request *http.Request) *http.Response {
+			resp := request.Respond()
+			name, err := url.PathUnescape(request.Vars.Value("name"))
+			if err != nil {
+				return http.Error(request, err)
+			}
+			if err = tmpl.Execute(resp, name); err != nil {
+				return http.Error(request, err)
+			}
+
+			return resp
+		}).
+		Static("/static", "static", func(next inbuilt.Handler, request *http.Request) *http.Response {
+			resp := next(request)
+
+			if strings.HasSuffix(request.Path, ".css") {
+				resp = resp.ContentType(mime.CSS)
+			}
+
+			return resp
+		}).
 		Alias("/age", "/static/age.html")
 
-	app := indigo.New(*addr)
-
-	if len(*https) > 0 {
-		if len(*cert) > 0 {
-			certificate, key := splitPaths(*cert)
-			app.HTTPS(*https, certificate, key)
-		} else {
-			app.AutoHTTPS(*https)
+	app := indigo.New(*httpAddr)
+	if len(*certdir) > 0 {
+		certfile := path.Join(*certdir, "fullchain.pem")
+		keyfile := path.Join(*certdir, "privkey.pem")
+		cert, err := tls.LoadX509KeyPair(certfile, keyfile)
+		if err != nil {
+			log.Fatalf("failed to load TLS certficates: %s", err)
+			return
 		}
+
+		app.TLS(*httpsAddr, cert)
 	}
 
-	err = app.OnBind(func(addr string) {
-		log.Printf("listening on %s\n", addr)
-	}).Serve(r)
-	log.Fatal(err)
-}
-
-func splitPaths(paths string) (cert, key string) {
-	files := strings.SplitN(paths, ",", 2)
-	if len(files) < 2 {
-		panic("bad HTTPS cert and key pair")
-	}
-
-	return files[0], files[1]
+	log.Fatal(
+		app.
+			Codec(codec.Suit()...).
+			OnBind(func(addr string) {
+				log.Println("listening on", addr)
+			}).
+			Serve(r),
+	)
 }
