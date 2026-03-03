@@ -40,6 +40,9 @@ func main() {
 	r := inbuilt.New().
 		Use(middleware.Recover).
 		Use(middleware.LogRequests()).
+		Use(func(next inbuilt.Handler, req *http.Request) *http.Response {
+			return next(req).Header("Server", "indigo")
+		}).
 		Get("/", func(request *http.Request) *http.Response {
 			name := request.Params.ValueOr("n", homeDefaultName)
 			resp := request.Respond()
